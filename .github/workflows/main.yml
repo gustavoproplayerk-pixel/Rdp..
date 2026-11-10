@@ -1,26 +1,27 @@
-name: RDP-Highest-GPU-8Cores-AutoSave
+name: RDP-Stable-GPU-Optimized
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp-highest-gpu-autosave:
+  secure-rdp-stable:
+    # Usa windows-2022-gpu para ter acesso à GPU virtualizada
     runs-on: windows-2022-gpu
     
-    resources:
-      cpu: 8
-      memory: 32Gi
-
     timeout-minutes: 3600
 
     steps:
       - name: Configure Core RDP Settings
         run: |
+          # Habilita RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Permite conexão sem NLA (mais compatível com Tailscale/Redes externas)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "UserAuthentication" -Value 0 -Force
           
+          # Abre porta 3389 no firewall
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
@@ -71,8 +72,10 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
+          # Conecta ao Tailscale usando sua chave secreta
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
+          # Aguarda obter IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -95,14 +98,16 @@ jobs:
           
           Write-Host "Detected CPU Cores: $cpuCount"
           Write-Host "Detected GPU: $($gpuInfo.Name)"
-          Write-Host "VRAM: $([math]::Round($gpuInfo.AdapterRAM / 1GB, 2)) GB"
           
           echo "CPU_CORES=$cpuCount" >> $env:GITHUB_ENV
           echo "GPU_NAME=$($gpuInfo.Name)" >> $env:GITHUB_ENV
 
-      - name: Optimize Windows for High Performance
+      - name: Optimize Windows for Gaming Performance
         run: |
+          # Modo Alto Desempenho
           powercfg /setactive 8c5e7f1e-a2b4-4d77-b8e0-9c5d6b8a1f2d
+          
+          # Desabilita serviços desnecessários que consomem recursos
           Set-Service -Name DiagTrack -StartupType Disabled
           Stop-Service -Name DiagTrack -ErrorAction SilentlyContinue
           Set-Service -Name WSearch -StartupType Manual
@@ -118,6 +123,7 @@ jobs:
           try {
               Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
           } catch {
+              # Fallback caso o link principal mude
               $fallbackUrl = "https://clientgamecdn.roblox.com/v/launcher/latest/setup_roblox.exe"
               Invoke-WebRequest -Uri $fallbackUrl -OutFile $installerPath -UseBasicParsing
           }
@@ -133,87 +139,34 @@ jobs:
               exit 1
           }
 
-      - name: Configure Auto-Save Settings
+      - name: Launch Roblox Launcher
         run: |
-          # Cria uma pasta dedicada para logs de save e checkpoints
-          $robloxBin = Get-ChildItem -Path "$env:LOCALAPPDATA\Roblox\Versions" -Recurse -Filter "RobloxPlayerLauncher.exe" | Select-Object -First 1
-          $robloxExe = $robloxBin.FullName
-          
-          # Configurações globais do Roblox para garantir que dados locais sejam salvos
-          $registryPath = "HKCU:\Software\Roblox"
-          if (-not (Test-Path $registryPath)) {
-              New-Item -Path $registryPath -Force | Out-Null
-          }
-          
-          # Garante que o Roblox salva dados locais em vez de depender apenas de cache de rede
-          Set-ItemProperty -Path $registryPath -Name "EnableLocalStorage" -Value 1 -Force
-          
-          # Cria um script de monitoramento de memória para detectar crashes antes do save falhar
-          $monitorScript = @"
-          param([string]\$exePath)
-          \$process = Start-Process \$exePath -PassThru
-          \$watcher = New-Object System.Diagnostics.PerformanceCounter("Process", "Working Set - Private", \$process.ProcessName)
-          while (\$process.HasExited -eq \$false) {
-              Start-Sleep -Seconds 10
-              \$memUsage = \$watcher.NextValue() / 1MB
-              if (\$memUsage -gt 2000) { # Se usar mais de 2GB, alerta sobre possível instabilidade
-                  Write-Warning "High Memory Usage: \$\$memUsage MB"
-              }
-          }
-"@
-          Set-Content -Path "$env:TEMP\roblox_monitor.ps1" -Value $monitorScript
-          Write-Host "Auto-Save Monitor Script Created."
-
-      - name: Launch Roblox and Simulate Auto-Save
-        run: |
-          Write-Host "Launching Roblox to verify environment..."
-          
+          # Inicia apenas o launcher para que você possa conectar via RDP e escolher o jogo
           $robloxBin = Get-ChildItem -Path "$env:LOCALAPPDATA\Roblox\Versions" -Recurse -Filter "RobloxPlayerLauncher.exe" | Select-Object -First 1
           
           if ($robloxBin) {
-              Write-Host "Found launcher at: $($robloxBin.FullName)"
-              
-              # Inicia o Roblox sem argumentos (abrirá na tela inicial)
+              Write-Host "Launching Roblox Client..."
               Start-Process $robloxBin.FullName
               
-              # Aguarda o Roblox carregar completamente
-              $count = 0
-              while ($count -lt 60) {
-                  Start-Sleep -Seconds 2
-                  if (Get-Process "RobloxPlayerLauncher" -ErrorAction SilentlyContinue) {
-                      Write-Host "Roblox is running!"
-                      break
-                  }
-                  $count++
+              # Aguarda o processo iniciar
+              Start-Sleep -Seconds 10
+              
+              if (Get-Process "RobloxPlayerLauncher" -ErrorAction SilentlyContinue) {
+                  Write-Host "Roblox is running and ready for connection."
+              } else {
+                  Write-Warning "Roblox process did not start immediately."
               }
-
-              # Simula um ciclo de Auto-Save (Se o usuário estiver em um jogo que suporta F5 ou Ctrl+S)
-              # Nota: Isso assume que o usuário já entrou em um jogo. Se quiser entrar em um jogo específico:
-              # $gameUrl = "https://www.roblox.com/games/ID_DO_JOGO"
-              # Start-Process $robloxBin.FullName -ArgumentList "-url $gameUrl"
-              
-              Write-Host "Simulating Auto-Save Key Press (F5)..."
-              Add-Type -AssemblyName System.Windows.Forms
-              [System.Windows.Forms.SendKeys]::SendWait("{F5}")
-              Start-Sleep -Seconds 2
-              
-              Write-Host "Second Auto-Save Attempt (Ctrl+S)..."
-              [System.Windows.Forms.SendKeys]::SendWait("^s")
-              Start-Sleep -Seconds 2
-              
-              Write-Host "Auto-Save sequence completed."
           } else {
               Write-Error "Roblox executable not found."
           }
 
-      - name: Final Status with Save Info
+      - name: Final Status
         run: |
           Write-Host "=========================================="
-          Write-Host "SYSTEM READY WITH 8 CORES AND AUTO-SAVE"
+          Write-Host "SYSTEM READY"
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "RDP User: RDP"
           Write-Host "RDP Port: 3389"
           Write-Host "CPU Cores: $env:CPU_CORES"
           Write-Host "GPU: $env:GPU_NAME"
-          Write-Host "LocalStorage Enabled: True"
           Write-Host "=========================================="
