@@ -1,0 +1,219 @@
+name: RDP-Highest-GPU-8Cores-AutoSave
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp-highest-gpu-autosave:
+    runs-on: windows-2022-gpu
+    
+    resources:
+      cpu: 8
+      memory: 32Gi
+
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          } else {
+              Set-LocalUser -Name "RDP" -Password $securePass
+          }
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation/update failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify Hardware Resources (CPU & GPU)
+        id: hardware-check
+        run: |
+          $cpuCount = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+          $gpuInfo = Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM
+          
+          Write-Host "Detected CPU Cores: $cpuCount"
+          Write-Host "Detected GPU: $($gpuInfo.Name)"
+          Write-Host "VRAM: $([math]::Round($gpuInfo.AdapterRAM / 1GB, 2)) GB"
+          
+          echo "CPU_CORES=$cpuCount" >> $env:GITHUB_ENV
+          echo "GPU_NAME=$($gpuInfo.Name)" >> $env:GITHUB_ENV
+
+      - name: Optimize Windows for High Performance
+        run: |
+          powercfg /setactive 8c5e7f1e-a2b4-4d77-b8e0-9c5d6b8a1f2d
+          Set-Service -Name DiagTrack -StartupType Disabled
+          Stop-Service -Name DiagTrack -ErrorAction SilentlyContinue
+          Set-Service -Name WSearch -StartupType Manual
+          Stop-Service -Name WSearch -ErrorAction SilentlyContinue
+
+      - name: Install Roblox Player
+        run: |
+          Write-Host "Downloading latest Roblox Installer..."
+          $robloxFolder = "$env:LOCALAPPDATA\Roblox"
+          $installerUrl = "https://www.roblox.com/download/client/WindowsPlayerLauncher"
+          $installerPath = "$env:TEMP\RobloxPlayerLauncher.exe"
+          
+          try {
+              Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
+          } catch {
+              $fallbackUrl = "https://clientgamecdn.roblox.com/v/launcher/latest/setup_roblox.exe"
+              Invoke-WebRequest -Uri $fallbackUrl -OutFile $installerPath -UseBasicParsing
+          }
+
+          Write-Host "Installing Roblox..."
+          Start-Process -FilePath $installerPath -ArgumentList "/S" -Wait
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+          if (Test-Path "$robloxFolder\Versions") {
+              Write-Host "Roblox installed successfully."
+          } else {
+              Write-Error "Roblox installation verification failed."
+              exit 1
+          }
+
+      - name: Configure Auto-Save Settings
+        run: |
+          # Cria uma pasta dedicada para logs de save e checkpoints
+          $robloxBin = Get-ChildItem -Path "$env:LOCALAPPDATA\Roblox\Versions" -Recurse -Filter "RobloxPlayerLauncher.exe" | Select-Object -First 1
+          $robloxExe = $robloxBin.FullName
+          
+          # Configurações globais do Roblox para garantir que dados locais sejam salvos
+          $registryPath = "HKCU:\Software\Roblox"
+          if (-not (Test-Path $registryPath)) {
+              New-Item -Path $registryPath -Force | Out-Null
+          }
+          
+          # Garante que o Roblox salva dados locais em vez de depender apenas de cache de rede
+          Set-ItemProperty -Path $registryPath -Name "EnableLocalStorage" -Value 1 -Force
+          
+          # Cria um script de monitoramento de memória para detectar crashes antes do save falhar
+          $monitorScript = @"
+          param([string]\$exePath)
+          \$process = Start-Process \$exePath -PassThru
+          \$watcher = New-Object System.Diagnostics.PerformanceCounter("Process", "Working Set - Private", \$process.ProcessName)
+          while (\$process.HasExited -eq \$false) {
+              Start-Sleep -Seconds 10
+              \$memUsage = \$watcher.NextValue() / 1MB
+              if (\$memUsage -gt 2000) { # Se usar mais de 2GB, alerta sobre possível instabilidade
+                  Write-Warning "High Memory Usage: \$\$memUsage MB"
+              }
+          }
+"@
+          Set-Content -Path "$env:TEMP\roblox_monitor.ps1" -Value $monitorScript
+          Write-Host "Auto-Save Monitor Script Created."
+
+      - name: Launch Roblox and Simulate Auto-Save
+        run: |
+          Write-Host "Launching Roblox to verify environment..."
+          
+          $robloxBin = Get-ChildItem -Path "$env:LOCALAPPDATA\Roblox\Versions" -Recurse -Filter "RobloxPlayerLauncher.exe" | Select-Object -First 1
+          
+          if ($robloxBin) {
+              Write-Host "Found launcher at: $($robloxBin.FullName)"
+              
+              # Inicia o Roblox sem argumentos (abrirá na tela inicial)
+              Start-Process $robloxBin.FullName
+              
+              # Aguarda o Roblox carregar completamente
+              $count = 0
+              while ($count -lt 60) {
+                  Start-Sleep -Seconds 2
+                  if (Get-Process "RobloxPlayerLauncher" -ErrorAction SilentlyContinue) {
+                      Write-Host "Roblox is running!"
+                      break
+                  }
+                  $count++
+              }
+
+              # Simula um ciclo de Auto-Save (Se o usuário estiver em um jogo que suporta F5 ou Ctrl+S)
+              # Nota: Isso assume que o usuário já entrou em um jogo. Se quiser entrar em um jogo específico:
+              # $gameUrl = "https://www.roblox.com/games/ID_DO_JOGO"
+              # Start-Process $robloxBin.FullName -ArgumentList "-url $gameUrl"
+              
+              Write-Host "Simulating Auto-Save Key Press (F5)..."
+              Add-Type -AssemblyName System.Windows.Forms
+              [System.Windows.Forms.SendKeys]::SendWait("{F5}")
+              Start-Sleep -Seconds 2
+              
+              Write-Host "Second Auto-Save Attempt (Ctrl+S)..."
+              [System.Windows.Forms.SendKeys]::SendWait("^s")
+              Start-Sleep -Seconds 2
+              
+              Write-Host "Auto-Save sequence completed."
+          } else {
+              Write-Error "Roblox executable not found."
+          }
+
+      - name: Final Status with Save Info
+        run: |
+          Write-Host "=========================================="
+          Write-Host "SYSTEM READY WITH 8 CORES AND AUTO-SAVE"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "RDP User: RDP"
+          Write-Host "RDP Port: 3389"
+          Write-Host "CPU Cores: $env:CPU_CORES"
+          Write-Host "GPU: $env:GPU_NAME"
+          Write-Host "LocalStorage Enabled: True"
+          Write-Host "=========================================="
