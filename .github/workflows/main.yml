@@ -1,27 +1,23 @@
-name: RDP-Stable-GPU-Optimized
+name: RDP-Stable-Latest
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp-stable:
-    # Usa windows-2022-gpu para ter acesso à GPU virtualizada
-    runs-on: windows-2022-gpu
+  secure-rdp-latest:
+    # FORÇADO PARA windows-latest conforme solicitado
+    runs-on: windows-latest
     
     timeout-minutes: 3600
 
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Habilita RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
-          
-          # Permite conexão sem NLA (mais compatível com Tailscale/Redes externas)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "UserAuthentication" -Value 0 -Force
           
-          # Abre porta 3389 no firewall
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
@@ -72,10 +68,8 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          # Conecta ao Tailscale usando sua chave secreta
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          # Aguarda obter IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -90,32 +84,10 @@ jobs:
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Verify Hardware Resources (CPU & GPU)
-        id: hardware-check
-        run: |
-          $cpuCount = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
-          $gpuInfo = Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM
-          
-          Write-Host "Detected CPU Cores: $cpuCount"
-          Write-Host "Detected GPU: $($gpuInfo.Name)"
-          
-          echo "CPU_CORES=$cpuCount" >> $env:GITHUB_ENV
-          echo "GPU_NAME=$($gpuInfo.Name)" >> $env:GITHUB_ENV
-
-      - name: Optimize Windows for Gaming Performance
-        run: |
-          # Modo Alto Desempenho
-          powercfg /setactive 8c5e7f1e-a2b4-4d77-b8e0-9c5d6b8a1f2d
-          
-          # Desabilita serviços desnecessários que consomem recursos
-          Set-Service -Name DiagTrack -StartupType Disabled
-          Stop-Service -Name DiagTrack -ErrorAction SilentlyContinue
-          Set-Service -Name WSearch -StartupType Manual
-          Stop-Service -Name WSearch -ErrorAction SilentlyContinue
-
       - name: Install Roblox Player
         run: |
           Write-Host "Downloading latest Roblox Installer..."
+          # Link oficial direto para o launcher mais recente
           $robloxFolder = "$env:LOCALAPPDATA\Roblox"
           $installerUrl = "https://www.roblox.com/download/client/WindowsPlayerLauncher"
           $installerPath = "$env:TEMP\RobloxPlayerLauncher.exe"
@@ -129,6 +101,7 @@ jobs:
           }
 
           Write-Host "Installing Roblox..."
+          # Instala silenciosamente
           Start-Process -FilePath $installerPath -ArgumentList "/S" -Wait
           Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
@@ -139,17 +112,17 @@ jobs:
               exit 1
           }
 
-      - name: Launch Roblox Launcher
+      - name: Launch Roblox Launcher for RDP Access
         run: |
-          # Inicia apenas o launcher para que você possa conectar via RDP e escolher o jogo
-          $robloxBin = Get-ChildItem -Path "$env:LOCALAPPDATA\Roblox\Versions" -Recurse -Filter "RobloxPlayerLauncher.exe" | Select-Object -First 1
+          # Encontra o executável mais recente do Roblox
+          $robloxBin = Get-ChildItem -Path "$robloxFolder\Versions" -Recurse -Filter "RobloxPlayerLauncher.exe" | Select-Object -First 1
           
           if ($robloxBin) {
               Write-Host "Launching Roblox Client..."
               Start-Process $robloxBin.FullName
               
-              # Aguarda o processo iniciar
-              Start-Sleep -Seconds 10
+              # Aguarda o processo iniciar para garantir estabilidade
+              Start-Sleep -Seconds 15
               
               if (Get-Process "RobloxPlayerLauncher" -ErrorAction SilentlyContinue) {
                   Write-Host "Roblox is running and ready for connection."
@@ -163,10 +136,8 @@ jobs:
       - name: Final Status
         run: |
           Write-Host "=========================================="
-          Write-Host "SYSTEM READY"
+          Write-Host "SYSTEM READY (windows-latest)"
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "RDP User: RDP"
           Write-Host "RDP Port: 3389"
-          Write-Host "CPU Cores: $env:CPU_CORES"
-          Write-Host "GPU: $env:GPU_NAME"
           Write-Host "=========================================="
